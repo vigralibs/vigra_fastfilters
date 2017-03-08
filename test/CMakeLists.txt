@@ -4,5 +4,5 @@ file(GLOB TEST_TARGETS test_*.cxx)
 
 FOREACH(FILE ${TEST_TARGETS})
     GET_FILENAME_COMPONENT(TARGET ${FILE} NAME_WE)
-    vigra_add_test(${TARGET} SOURCES ${FILE} LIBRARIES vigra_math)
+    vigra_add_test(${TARGET} SOURCES ${FILE} LIBRARIES vigra_fastfilters)
 ENDFOREACH(FILE)
