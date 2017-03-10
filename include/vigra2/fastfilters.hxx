@@ -42,6 +42,8 @@
 #include <vigra2/numeric_traits.hxx>
 #include <vigra2/array_nd.hxx>
 #include <immintrin.h>
+#include <cassert>
+#include <stdexcept>
 
 // FIXME: may not be needed (no speedup observed)
 //#ifdef HAVE_BUILTIN_EXPECT
@@ -63,6 +65,42 @@ namespace vigra {
 /** \addtogroup Filters
 */
 //@{
+
+
+#define ALIGN_MAGIC 0xd2ac461d9c25ee00
+
+void *fastfilters_memory_align(size_t alignment, size_t size)
+{
+    assert(alignment < 0xff);
+    void *ptr = malloc(size + alignment + 8);
+
+    if (!ptr)
+        return NULL;
+
+    uintptr_t ptr_i = (uintptr_t)ptr;
+    ptr_i += 8 + alignment - 1;
+    ptr_i &= ~(alignment - 1);
+
+    uintptr_t ptr_diff = ptr_i - (uintptr_t)ptr;
+
+    void *ptr_aligned = (void *)ptr_i;
+    uint64_t *ptr_magic = (uint64_t *)(ptr_i - 8);
+
+    *ptr_magic = ALIGN_MAGIC | (ptr_diff & 0xff);
+
+    return ptr_aligned;
+}
+
+void fastfilters_memory_align_free(void *vptr)
+{
+    char * ptr = (char*)vptr;
+    uint64_t magic = *(uint64_t *)(ptr - 8);
+
+    assert((magic & ~0xff) == ALIGN_MAGIC);
+
+    ptr -= magic & 0xff;
+    free(ptr);
+}
 
 enum KernelSymmetry { KernelEven, KernelOdd, KernelNotSymmetric };
 
@@ -96,46 +134,40 @@ struct AddBySymmetry<KernelOdd>
     }
 };
 
-template <KernelSymmetry SYMMETRY = KernelEven, ArrayIndex RADIUS = runtime_size>
-struct AvxConvolveLine
+template <ArrayIndex RADIUS>
+struct RadiusLoopUnrolling
 {
-    //static void exec_x(float * in, ArrayIndex size, float * out,
-    //                   float * kernel)
-    //{
-    //    for (ArrayIndex x = 0; x < radius; ++x)
-    //    {
-    //        float sum = kernel->coefs[0] * cur_input[x];
-
-    //        for (unsigned int k = 1; k < x; ++k) {
-    //            float left;
-    //            if (-(int)k + (int)x < 0)
-    //                left = in_border_left[y * borderptr_outer_stride + (FF_KERNEL_LEN - (int)k + (int)x)];
-    //            else
-    //                left = cur_input[x - k];
-
-    //            sum += kernel->coefs[k] * kernel_addsub_ss(cur_input[x + k], left);
-    //        }
-
-    //        cur_output[x] = sum;
-    //    }
-    //}
+    constexpr ArrayIndex operator()(ArrayIndex) const
+    {
+        return RADIUS;
+    }
 };
 
-template <KernelSymmetry SYMMETRY>
-struct AvxConvolveLine<SYMMETRY, runtime_size>
+template <>
+struct RadiusLoopUnrolling<runtime_size>
+{
+    ArrayIndex operator()(ArrayIndex radius) const
+    {
+        return radius;
+    }
+};
+
+template <KernelSymmetry SYMMETRY = KernelEven, ArrayIndex RADIUS = runtime_size>
+struct AvxConvolveLine
 {
     static void exec_x(float * in, ArrayIndex size, float * out,
                        float * kernel, ArrayIndex radius)
     {
         AddBySymmetry<SYMMETRY> addsub;
+        RadiusLoopUnrolling<RADIUS> const_radius;
 
         // FIXME: check kernel longer than line
         ArrayIndex x = 0;
-        for (; x < radius; ++x)
+        for (; x < const_radius(radius); ++x)
         {
             float sum = kernel[0] * in[x];
 
-            for (ArrayIndex k = 1; k <= radius; ++k)
+            for (ArrayIndex k = 1; k <= const_radius(radius); ++k)
             {
                 ArrayIndex offset_left  = x < k ? k - x
                                                 : x - k,
@@ -149,7 +181,7 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
         }
 
         // FIXME: check if this must be radius + 1
-        ArrayIndex steps = (size - radius - x) / 32;
+        ArrayIndex steps = (size - const_radius(radius) - x) / 32;
         for(ArrayIndex j = 0; j < steps; ++j, x += 32)
         {
             // load next 32 pixels
@@ -166,7 +198,8 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
             result3 = _mm256_mul_ps(result3, kernel_val);
 
             // work on both sides of symmetric kernel simultaneously
-            for (ArrayIndex k = 1; k <= radius; ++k)
+            // FIXME: consider explicit loop unrolling
+            for (ArrayIndex k = 1; k <= const_radius(radius); ++k)
             {
                 kernel_val = _mm256_broadcast_ss(kernel + k);
 
@@ -193,7 +226,7 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
         }
 
         // FIXME: check if this must be radius + 1
-        steps = (size - radius - x) / 8;
+        steps = (size - const_radius(radius) - x) / 8;
         for (ArrayIndex j = 0; j < steps; ++j, x += 8)
         {
             // load next 8 pixels
@@ -204,7 +237,7 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
             result0 = _mm256_mul_ps(result0, kernel_val);
 
             // work on both sides of symmetric kernel simultaneously
-            for (ArrayIndex k = 1; k <= radius; ++k)
+            for (ArrayIndex k = 1; k <= const_radius(radius); ++k)
             {
                 kernel_val = _mm256_broadcast_ss(kernel + k);
 
@@ -217,12 +250,12 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
         }
 
         // FIXME: check if this must be radius + 1
-        for (; x < size - radius; ++x)
+        for (; x < size - const_radius(radius); ++x)
         {
             float sum = kernel[0] * in[x];
 
             // work on both sides of symmetric kernel simultaneously
-            for (ArrayIndex k = 1; k <= radius; ++k)
+            for (ArrayIndex k = 1; k <= const_radius(radius); ++k)
             {
                 sum += kernel[k] * addsub(in[x + k], in[x - k]);
             }
@@ -234,7 +267,7 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
         {
             float sum = in[x] * kernel[0];
 
-            for (ArrayIndex k = 1; k <= radius; ++k)
+            for (ArrayIndex k = 1; k <= const_radius(radius); ++k)
             {
                 float left = unlikely(x < k) ? in[k - x]
                                              : in[x - k],
@@ -246,6 +279,211 @@ struct AvxConvolveLine<SYMMETRY, runtime_size>
 
             out[x] = sum;
         }
+    }
+
+    static void exec_y(float * in, ArrayIndex width, ArrayIndex height, ArrayIndex in_stride,
+                       float * out, ArrayIndex out_stride,
+                       float * kernel, ArrayIndex radius)
+    {
+        AddBySymmetry<SYMMETRY> addsub;
+        RadiusLoopUnrolling<RADIUS> const_radius;
+
+        // FIXME: check kernel longer than line
+
+        const size_t avx_end = (size_t)width & ~7; // round down to nearest multiple of 8
+        const size_t noavx_left = (size_t)width - avx_end;
+        const size_t n_outer_aligned = avx_end + 8;
+
+        const __m256i mask =
+            _mm256_set_epi32(0, noavx_left >= 7 ? 0xffffffff : 0, noavx_left >= 6 ? 0xffffffff : 0,
+                             noavx_left >= 5 ? 0xffffffff : 0, noavx_left >= 4 ? 0xffffffff : 0,
+                             noavx_left >= 3 ? 0xffffffff : 0, noavx_left >= 2 ? 0xffffffff : 0, 0xffffffff);
+
+        float * tmp = (float*)fastfilters_memory_align(32, (radius + 1) * n_outer_aligned * sizeof(float));
+        if(!tmp)
+            throw std::bad_alloc();
+
+        size_t y = 0;
+
+        // left border
+        for (; y < const_radius(radius); ++y)
+        {
+            const float *cur_inptr = in + y * in_stride;
+            const size_t tmpidx = y % (const_radius(radius) + 1);
+            float *tmpptr = tmp + tmpidx * n_outer_aligned;
+
+            size_t x;
+            for (x = 0; x < avx_end; x += 8)
+            {
+                __m256 pixels = _mm256_loadu_ps(cur_inptr + x);
+                __m256 kernel_val = _mm256_broadcast_ss(kernel);
+                __m256 result = _mm256_mul_ps(pixels, kernel_val);
+
+                for (unsigned int k = 1; k <= const_radius(radius); ++k)
+                {
+                    kernel_val = _mm256_broadcast_ss(kernel + k);
+                    __m256 pixel_left = (k > y) ? _mm256_loadu_ps(in + (k - y) * in_stride + x)
+                                                : _mm256_loadu_ps(in + (y - k) * in_stride + x);
+
+                    __m256 pixels_right =
+                         likely(y + k < height) ? _mm256_loadu_ps(in + (y + k) * in_stride + x)
+                                                : _mm256_loadu_ps(in + (height - ((k + y) % height) - 2) * in_stride + x);
+
+                    pixels = addsub(pixels_right, pixel_left);
+                    result = _mm256_fmadd_ps(pixels, kernel_val, result);
+                }
+
+                _mm256_store_ps(tmpptr + x, result);
+            }
+
+            if (noavx_left > 0)
+            {
+                __m256 pixels = _mm256_maskload_ps(cur_inptr + x, mask);
+                __m256 kernel_val = _mm256_broadcast_ss(kernel);
+                __m256 result = _mm256_mul_ps(pixels, kernel_val);
+
+                for (unsigned int k = 1; k <= const_radius(radius); ++k)
+                {
+                    kernel_val = _mm256_broadcast_ss(kernel + k);
+                    __m256 pixel_left = (k > y)
+                          ? _mm256_maskload_ps(in + (k - y) * in_stride + x, mask)
+                          : _mm256_maskload_ps(in + (y - k) * in_stride + x, mask);
+
+                    __m256 pixels_right = likely(y + k < height)
+                        ? _mm256_maskload_ps(in + (y + k) * in_stride + x, mask)
+                        : _mm256_maskload_ps(in + (height - ((k + y) % height) - 2) * in_stride + x, mask);
+
+                    pixels = addsub(pixels_right, pixel_left);
+                    result = _mm256_fmadd_ps(pixels, kernel_val, result);
+                }
+
+                _mm256_store_ps(tmpptr + x, result);
+            }
+        }
+
+        // valid part of line
+        const size_t y_end = height - const_radius(radius);
+
+        for (; y < y_end; ++y)
+        {
+            const float *cur_inptr = in + y * in_stride;
+            const unsigned tmpidx = y % (const_radius(radius) + 1);
+            float *tmpptr = tmp + tmpidx * n_outer_aligned;
+
+            unsigned x;
+            for (x = 0; x < avx_end; x += 8)
+            {
+                __m256 pixels = _mm256_loadu_ps(cur_inptr + x);
+                __m256 kernel_val = _mm256_broadcast_ss(kernel);
+                __m256 result = _mm256_mul_ps(pixels, kernel_val);
+
+                for (unsigned int k = 1; k <= const_radius(radius); ++k)
+                {
+                    kernel_val = _mm256_broadcast_ss(kernel + k);
+
+                    pixels = addsub(_mm256_loadu_ps(in + (y + k) * in_stride + x),
+                                    _mm256_loadu_ps(in + (y - k) * in_stride + x));
+                    result = _mm256_fmadd_ps(pixels, kernel_val, result);
+                }
+
+                _mm256_store_ps(tmpptr + x, result);
+            }
+
+            if (noavx_left > 0)
+            {
+                __m256 pixels = _mm256_maskload_ps(cur_inptr + x, mask);
+                __m256 kernel_val = _mm256_broadcast_ss(kernel);
+                __m256 result = _mm256_mul_ps(pixels, kernel_val);
+
+                for (unsigned int k = 1; k <= const_radius(radius); ++k)
+                {
+                    kernel_val = _mm256_broadcast_ss(kernel + k);
+
+                    pixels = addsub(_mm256_maskload_ps(in + (y + k) * in_stride + x, mask),
+                                    _mm256_maskload_ps(in + (y - k) * in_stride + x, mask));
+                    result = _mm256_fmadd_ps(pixels, kernel_val, result);
+                }
+
+                _mm256_store_ps(tmpptr + x, result);
+            }
+
+            const unsigned writeidx = (y + 1) % (const_radius(radius) + 1);
+            float *writeptr = tmp + writeidx * n_outer_aligned;
+            memcpy(out + (y - const_radius(radius)) * out_stride, writeptr, width * sizeof(float));
+        }
+
+        // right border
+        for (; y < height; ++y)
+        {
+            const float *cur_inptr = in + y * in_stride;
+            const unsigned tmpidx = y % (const_radius(radius) + 1);
+            float *tmpptr = tmp + tmpidx * n_outer_aligned;
+
+            unsigned x;
+            for (x = 0; x < avx_end; x += 8)
+            {
+                __m256 pixels = _mm256_loadu_ps(cur_inptr + x);
+                __m256 kernel_val = _mm256_broadcast_ss(kernel);
+                __m256 result = _mm256_mul_ps(pixels, kernel_val);
+
+                for (unsigned int k = 1; k <= const_radius(radius); ++k)
+                {
+                    kernel_val = _mm256_broadcast_ss(kernel + k);
+                    __m256 pixel_right = (y + k < height)
+                        ? _mm256_loadu_ps(in + (y + k) * in_stride + x)
+                        : _mm256_loadu_ps(in + (height - ((k + y) % height) - 2) * in_stride + x);
+
+                    __m256 pixel_left = (k > y)
+                         ? _mm256_loadu_ps(in + (k - y) * in_stride + x)
+                         : _mm256_loadu_ps(in + (y - k) * in_stride + x);
+
+                    pixels = addsub(pixel_right, pixel_left);
+                    result = _mm256_fmadd_ps(pixels, kernel_val, result);
+                }
+
+                _mm256_store_ps(tmpptr + x, result);
+            }
+
+            if (noavx_left > 0)
+            {
+                __m256 pixels = _mm256_maskload_ps(cur_inptr + x, mask);
+                __m256 kernel_val = _mm256_broadcast_ss(kernel);
+                __m256 result = _mm256_mul_ps(pixels, kernel_val);
+
+                for (unsigned int k = 1; k <= const_radius(radius); ++k)
+                {
+                    kernel_val = _mm256_broadcast_ss(kernel + k);
+                    __m256 pixel_right = (y + k < height)
+                        ? _mm256_maskload_ps(in + (y + k) * in_stride + x, mask)
+                        : _mm256_maskload_ps(
+                            in + (height - ((k + y) % height) - 2) * in_stride + x, mask);
+
+                    __m256 pixel_left = (k > y)
+                        ? _mm256_maskload_ps(in + (k - y) * in_stride + x, mask)
+                        : _mm256_maskload_ps(in + (y - k) * in_stride + x, mask);
+
+                    pixels = addsub(pixel_right, pixel_left);
+                    result = _mm256_fmadd_ps(pixels, kernel_val, result);
+                }
+
+                _mm256_store_ps(tmpptr + x, result);
+            }
+
+            const unsigned writeidx = (y + 1) % (const_radius(radius) + 1);
+            float *writeptr = tmp + writeidx * n_outer_aligned;
+            memcpy(out + (y - const_radius(radius)) * out_stride, writeptr, width * sizeof(float));
+        }
+
+        // copy from scratch memory to real output
+        for (unsigned k = 0; k < const_radius(radius); ++k)
+        {
+            unsigned y = height + k;
+            const unsigned writeidx = (y + 1) % (const_radius(radius) + 1);
+            float *writeptr = tmp + writeidx * n_outer_aligned;
+            memcpy(out + (y - const_radius(radius)) * out_stride, writeptr, width * sizeof(float));
+        }
+
+        fastfilters_memory_align_free(tmp);
     }
 };
 

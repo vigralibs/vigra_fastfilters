@@ -1,6 +1,6 @@
 /************************************************************************/
 /*                                                                      */
-/*               Copyright 2014-2015 by Ullrich Koethe                  */
+/*               Copyright 2014-2017 by Ullrich Koethe                  */
 /*                                                                      */
 /*    This file is part of the VIGRA2 computer vision library.          */
 /*    The VIGRA2 Website is                                             */
@@ -51,7 +51,7 @@ struct FastFiltersTest
         data[size / 2] = 1.0f;
 
         float kernel[] = { 0.4f, 0.25f, 0.05f };
-        AvxConvolveLine<>::exec_x(&data[0], size, &res[0], kernel, 2);
+        AvxConvolveLine<KernelEven, 2>::exec_x(&data[0], size, &res[0], kernel, 2);
 
         for (int k = 0; k < size; ++k)
         {
@@ -68,6 +68,32 @@ struct FastFiltersTest
             }
         }
     }
+
+    void testYFilter()
+    {
+        int size = 21;
+        std::vector<float> data(size, 0.0f), res(size, 0.0f);
+        data[size / 2] = 1.0f;
+
+        float kernel[] = { 0.4f, 0.25f, 0.05f };
+        AvxConvolveLine<KernelEven, 2>::exec_y(&data[0], 1, size, 1, &res[0], 1, kernel, 2);
+
+        for (int k = 0; k < size; ++k)
+        {
+            int d = std::abs(size / 2 - k);
+            switch (d)
+            {
+            case 0:
+            case 1:
+            case 2:
+                shouldEqual(res[k], kernel[d]);
+                break;
+            default:
+                shouldEqual(res[k], 0.0f);
+            }
+        }
+    }
+
 };
 
 
@@ -78,6 +104,7 @@ struct FastFiltersTestSuite
     : test_suite("FastFiltersTestSuite")
     {
         add(testCase(&FastFiltersTest::testXFilter));
+        add(testCase(&FastFiltersTest::testYFilter));
     }
 };
 
